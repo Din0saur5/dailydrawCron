@@ -3,6 +3,8 @@ import { DeleteObjectsCommand, S3Client } from '@aws-sdk/client-s3';
 
 const BATCH_SIZE = 1000;
 const PREMIUM_RPC_CHUNK_SIZE = 25;
+const DIFFICULTIES = ['very_easy', 'easy', 'medium', 'advanced'] as const;
+type Difficulty = (typeof DIFFICULTIES)[number];
 
 type SubmissionRow = {
   id: string;
@@ -261,9 +263,67 @@ async function main(): Promise<void> {
   console.log(
     `Cleanup finished. Deleted ${totalRowsDeleted} submissions and ${totalFilesDeleted} files.`,
   );
+
+  await ensureDailyPromptsForDate(cutoffDate);
 }
 
 main().catch((error) => {
   console.error('Cleanup failed:', error);
   process.exitCode = 1;
 });
+
+async function ensureDailyPromptsForDate(date: string) {
+  console.log('Ensuring daily prompts exist for', date);
+  for (const difficulty of DIFFICULTIES) {
+    const prompt = await fetchNextPromptFromBank(difficulty);
+    if (!prompt) {
+      console.warn(`No available prompt found for difficulty ${difficulty}.`);
+      continue;
+    }
+    await insertDailyPrompt(date, prompt);
+    console.log(`Seeded prompt ${prompt.id} for difficulty ${difficulty}.`);
+  }
+}
+
+async function fetchNextPromptFromBank(difficulty: Difficulty) {
+  const { data, error } = await supabase
+    .from('prompt_bank_available')
+    .select('id,prompt_text,difficulty')
+    .eq('difficulty', difficulty)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    throw new Error(
+      `Failed to fetch prompt for ${difficulty}: ${error.message ?? error}`,
+    );
+  }
+  return data as
+    | { id: number | string; prompt_text: string; difficulty: Difficulty }
+    | null;
+}
+
+async function insertDailyPrompt(
+  date: string,
+  prompt: { id: number | string; prompt_text: string; difficulty: Difficulty },
+) {
+  const { start } = getUtcDayBounds(date);
+  const { error } = await supabase.from('daily_prompts').insert({
+    prompt_bank_id: prompt.id,
+    prompt_text: prompt.prompt_text,
+    prompt_date: start,
+    difficulty: prompt.difficulty,
+  });
+  if (error) {
+    throw new Error(
+      `Failed to insert daily prompt for ${prompt.difficulty}: ${error.message ?? error}`,
+    );
+  }
+}
+
+function getUtcDayBounds(date: string) {
+  const start = new Date(`${date}T00:00:00Z`);
+  const end = new Date(start);
+  end.setUTCDate(end.getUTCDate() + 1);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
