@@ -1,4 +1,4 @@
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type PostgrestError } from '@supabase/supabase-js';
 import { DeleteObjectsCommand, S3Client } from '@aws-sdk/client-s3';
 
 const BATCH_SIZE = 1000;
@@ -63,6 +63,7 @@ const s3 = new S3Client({
 });
 
 const premiumStatusCache = new Map<string, boolean>();
+let warnedAboutLegacyPremiumFn = false;
 
 async function fetchBatch(
   cutoffDate: string,
@@ -94,9 +95,7 @@ async function fetchPremiumStatus(userId: string): Promise<boolean> {
     return premiumStatusCache.get(userId)!;
   }
 
-  const { data, error } = await supabase.rpc('user_is_premium', {
-    user_id: userId,
-  });
+  const { data, error } = await invokeUserIsPremium(userId);
 
   if (error) {
     throw new Error(
@@ -114,6 +113,38 @@ async function fetchPremiumStatus(userId: string): Promise<boolean> {
 
   premiumStatusCache.set(userId, data);
   return data;
+}
+
+function isMissingUserIdArgument(error: PostgrestError | null): boolean {
+  if (!error?.message) {
+    return false;
+  }
+  const message = error.message.toLowerCase();
+  return (
+    message.includes('could not find the function public.user_is_premium(user_id)') ||
+    (message.includes('user_is_premium') && message.includes('user_id'))
+  );
+}
+
+async function invokeUserIsPremium(userId: string) {
+  const firstAttempt = await supabase.rpc('user_is_premium', {
+    user_id: userId,
+  });
+
+  if (!isMissingUserIdArgument(firstAttempt.error)) {
+    return firstAttempt;
+  }
+
+  if (!warnedAboutLegacyPremiumFn) {
+    console.warn(
+      'user_is_premium RPC appears to expect a parameter named "uid". Please update the database function to use "user_id" to avoid this fallback.',
+    );
+    warnedAboutLegacyPremiumFn = true;
+  }
+
+  return supabase.rpc('user_is_premium', {
+    uid: userId,
+  });
 }
 
 async function ensurePremiumStatuses(userIds: string[]): Promise<void> {
